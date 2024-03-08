@@ -209,7 +209,7 @@ struct ad4630_state {
 	u8 pattern_bits_per_word;
 
 	u8 tx_data[6] __aligned(ARCH_KMALLOC_MINALIGN);
-	u8 rx_data[6];
+	u8 rx_data[10];
 };
 
 static int ad4630_spi_read(void *context, const void *reg, size_t reg_size,
@@ -309,6 +309,50 @@ out_error:
 	return ret;
 }
 
+static int ad4630_buffer_preenable(struct iio_dev *indio_dev);
+static int ad4630_buffer_postdisable(struct iio_dev *indio_dev);
+static int ad4630_sampling_enable(const struct ad4630_state *st, bool enable);
+
+static int ad4630_single_read_channel(struct ad4630_state *adc, unsigned int chn_idx,
+				  unsigned int *val)
+{
+	/* enable conv pwm */
+	ad4630_sampling_enable(adc, true);
+	fsleep(1);
+	ad4630_sampling_enable(adc, false);
+	fsleep(10);
+
+	// pwm_enable(adc->conv_trigger);
+	// u8 num_channel = 2;
+	struct spi_transfer xfer = {
+		// .bits_per_word = adc->bits_per_word,
+		// .speed_hz = adc->max_rate,
+		.len = 8,
+		// .speed_hz = AD4630_SPI_REG_ACCESS_SPEED,
+		.speed_hz = AD4630_SPI_SAMPLING_SPEED,
+		.rx_buf = adc->rx_data,
+		// .tx_buf = adc->tx_data
+	};
+	int ret;
+
+	// adc->cfg = reg;
+	// put_unaligned_be16(reg << 2, adc->spi_tx_data);
+	// if (adc->info->cfg_register)
+		// xfer.tx_buf = adc->spi_tx_data;
+	// xfer.rx_buf = adc->rx_data;
+
+	ret = spi_sync_transfer(adc->spi, &xfer, 1);
+	if (ret)
+		return ret;
+
+	*val = get_unaligned_le32(adc->rx_data);
+	// *val = chn_idx;
+	/* disable conv pwm */
+	// ad4630_sampling_enable(adc, false);
+	// pwm_disable(adc->conv_trigger);
+	return ret;
+}
+
 static int ad4630_read_raw(struct iio_dev *indio_dev,
 			   struct iio_chan_spec const *chan, int *val,
 			   int *val2, long info)
@@ -316,8 +360,31 @@ static int ad4630_read_raw(struct iio_dev *indio_dev,
 	struct ad4630_state *st = iio_priv(indio_dev);
 	unsigned int temp;
 	int ret;
+	// u32 dummy;
 
 	switch (info) {
+	case IIO_CHAN_INFO_RAW:
+		/* claim direct mode before proceeding */
+		ret = iio_device_claim_direct_mode(indio_dev);
+		if (ret)
+			return ret;
+		/* go to data streaming mode */
+		ret = regmap_write(st->regmap, AD4630_REG_EXIT_CFG_MODE, BIT(0));
+		/* Single shot reading */
+		ret = ad4630_single_read_channel(st, chan->scan_index, val);
+		ret = ad4630_single_read_channel(st, chan->scan_index, val);
+		if (ret)
+			goto err_out;
+		// *val = 2313123;
+		/* Extend signal to 32 bits since channels are differential */
+		*val = sign_extend32(*val, chan->scan_type.realbits - 1);
+		/* get back to register mode */
+		// ret = regmap_read(st->regmap, AD4630_REG_ACCESS, &dummy);
+		// if (ret)
+		// 	return ret;
+err_out:
+		iio_device_release_direct_mode(indio_dev);
+		return IIO_VAL_INT;
 	case IIO_CHAN_INFO_SAMP_FREQ:
 		ad4630_get_sampling_freq(st, val);
 		return IIO_VAL_INT;
@@ -773,7 +840,7 @@ static const struct iio_chan_spec_ext_info ad4630_ext_info[] = {
 
 #define AD4630_CHAN(_idx, _msk_avail, _storage, _real, _shift, _info) {	\
 	.info_mask_separate = BIT(IIO_CHAN_INFO_CALIBSCALE) |		\
-			BIT(IIO_CHAN_INFO_CALIBBIAS),			\
+			BIT(IIO_CHAN_INFO_CALIBBIAS) | BIT(IIO_CHAN_INFO_RAW),\
 	.info_mask_separate_available = _msk_avail,			\
 	.info_mask_shared_by_all = BIT(IIO_CHAN_INFO_SAMP_FREQ),	\
 	.info_mask_shared_by_type =  BIT(IIO_CHAN_INFO_SCALE),		\
